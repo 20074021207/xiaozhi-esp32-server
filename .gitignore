@@ -5,6 +5,8 @@ __pycache__/
 *$py.class
 .vscode
 .claude
+!main/xiaozhi-server/.claude
+!main/xiaozhi-server/.claude/**
 AGENTS.md
 
 # C extensions
