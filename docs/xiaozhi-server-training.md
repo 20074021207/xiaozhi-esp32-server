@@ -278,13 +278,38 @@ async def _initialize_private_config_async(self):
         private_config = await get_private_config_from_api(...)
         self.need_bind = False
         self.bind_completed_event.set()  # 允许消息处理
+    except DeviceNotFoundException as e:
+        self.need_bind = True
+        # event 保持未 set，消息被挂起
     except DeviceBindException as e:
         self.need_bind = True
-        self.bind_code = e.bind_code      # 6 位绑定码
-        # 未绑定时所有消息被丢弃，只播放绑定提示
+        self.bind_code = e.bind_code  # 6 位绑定码
+        # event 保持未 set，消息被挂起
 ```
 
-绑定码播报逻辑在 `receiveAudioHandle.py` 第 136 行。
+```python
+# connection.py 第 328 行起
+async def _route_message(self, message):
+    if not self.bind_completed_event.is_set():
+        try:
+            await asyncio.wait_for(self.bind_completed_event.wait(), timeout=1)
+        except asyncio.TimeoutError:
+            # 1 秒超时后播报绑定码
+            await self._discard_message_with_bind_prompt()
+            return
+
+    if self.need_bind:
+        await self._discard_message_with_bind_prompt()
+        return
+    # ... 正常消息处理
+```
+
+**完整流程：**
+1. 成功 → `need_bind=False` + `event.set()` → 直接进入消息循环
+2. 失败 → `need_bind=True`，**但 event 保持未 set**
+3. `_route_message()` 检测 event 未 set，wait() 最多 1 秒超时
+4. 超时 → `_discard_message_with_bind_prompt()` 播报 6 位绑定码，所有消息被丢弃
+5. 用户去智控台完成绑定后重连，进入成功路径
 
 ### 3.3 消息路由机制
 
@@ -504,81 +529,63 @@ async def handle_user_intent(conn, text):
 
 ```python
 def chat(self, query, depth=0):
-    # 防止无限递归
     MAX_DEPTH = 5
+    force_final_answer = False
+
+    # 1. 防止无限递归
     if depth >= MAX_DEPTH:
         force_final_answer = True
+        self.dialogue.put(Message(role="user", content="[系统提示] 已达到最大工具调用次数限制，直接给出最终答案。"))
 
-    # 1. 记录对话历史
+    # 2. depth==0 时：记录对话历史 + 发送 FIRST 标记
     if depth == 0:
+        self.sentence_id = str(uuid.uuid4().hex)
         self.dialogue.put(Message(role="user", content=query))
-        # 发送 FIRST 标记，通知 TTS 开始新句子
-        self.tts.tts_text_queue.put(TTSMessageDTO(
-            sentence_id=self.sentence_id,
-            sentence_type=SentenceType.FIRST,
-            content_type=ContentType.ACTION
-        ))
+        self.tts.tts_text_queue.put(TTSMessageDTO(sentence_id=self.sentence_id, sentence_type=SentenceType.FIRST, content_type=ContentType.ACTION))
 
-    # 2. 工具调用规则注入（长对话防偷懒机制）
-    if dialogue_length > 4:
-        self.dialogue.put(Message(
-            role="user",
-            content=TOOL_CALLING_RULES + tool_summary,
-            is_temporary=True  # 本轮后自动清理
-        ))
+    # 3. 工具调用规则注入（防偷懒：强提醒/中提醒两级）
+    # 条件：depth==0 AND query非空 AND function_call模式 AND 对话>4条
+    tool_call_reminder = None
+    if depth == 0 and query is not None and functions is not None:
+        dialogue_length = len(self.dialogue.dialogue)
+        if dialogue_length > 4:
+            tool_summary = self._get_tool_summary(functions)
+            if force_reminder:  # 强提醒：连续 >3 轮未调用工具
+                tool_call_reminder = TOOL_CALLING_RULES + "[重要提醒] 多轮未使用工具，本轮必须重新判断！当前可用工具: " + tool_summary
+            else:  # 中提醒：普通长对话
+                tool_call_reminder = TOOL_CALLING_RULES + "当前可用工具: " + tool_summary
+    if tool_call_reminder:
+        self.dialogue.put(Message(role="user", content=tool_call_reminder, is_temporary=True))
 
-    # 3. 查询记忆
+    # 4. 查询记忆
     memory_str = None
     if self.memory and query:
         memory_str = self.memory.query_memory(query)
 
-    # 4. 获取可用工具
-    functions = self.func_handler.get_functions() if function_call mode
-
     # 5. 调用 LLM（流式）
-    if function_call mode:
-        llm_responses = self.llm.response_with_functions(
-            session_id,
-            self.dialogue.get_llm_dialogue_with_memory(memory_str),
-            functions=functions
-        )
+    if self.intent_type == "function_call" and functions is not None and not force_final_answer:
+        llm_responses = self.llm.response_with_functions(session_id, self.dialogue.get_llm_dialogue_with_memory(memory_str), functions=functions)
     else:
-        llm_responses = self.llm.response(
-            session_id,
-            self.dialogue.get_llm_dialogue_with_memory(memory_str)
-        )
+        llm_responses = self.llm.response(session_id, self.dialogue.get_llm_dialogue_with_memory(memory_str))
 
     # 6. 流式处理响应
     for response in llm_responses:
         if tool_call_detected:
-            # 收集工具调用
             tool_calls_list.append(tool_call_data)
         else:
-            # 普通文本，推送到 TTS
-            self.tts.tts_text_queue.put(TTSMessageDTO(
-                sentence_id=self.sentence_id,
-                sentence_type=SentenceType.MIDDLE,
-                content_type=ContentType.TEXT,
-                content_detail=content
-            ))
+            self.tts.tts_text_queue.put(TTSMessageDTO(sentence_id=self.sentence_id, sentence_type=SentenceType.MIDDLE, content_type=ContentType.TEXT, content_detail=content))
 
     # 7. 处理工具调用
     if tool_calls_list:
         for tool_call in tool_calls_list:
-            result = self.func_handler.handle_llm_function_call(conn, tool_call)
-            # 添加工具结果到对话历史
+            result = self.func_handler.handle_llm_function_call(self, tool_call)
             self.dialogue.put(Message(role="tool", content=result.result))
-
-        # 递归调用，让 LLM 基于工具结果回复
         self.chat(tool_result, depth + 1)
 
-    # 8. 发送 LAST 标记
+    # 8. depth==0 时：发送 LAST 标记 + 清理临时消息
     if depth == 0:
-        self.tts.tts_text_queue.put(TTSMessageDTO(
-            sentence_id=self.sentence_id,
-            sentence_type=SentenceType.LAST,
-            content_type=ContentType.ACTION
-        ))
+        self.tts.tts_text_queue.put(TTSMessageDTO(sentence_id=self.sentence_id, sentence_type=SentenceType.LAST, content_type=ContentType.ACTION))
+        # 清理 is_temporary=True 的临时消息
 ```
 
 **工具调用防偷懒机制（TOOL_CALLING_RULES）：**
@@ -629,6 +636,7 @@ chat() ──→ tts_text_queue ──→ tts_text_priority_thread
 def _get_segment_text(self):
     full_text = "".join(self.tts_text_buff)
     current_text = full_text[self.processed_chars:]
+    last_punct_pos = -1
 
     # 第一句话使用更宽泛的标点（尽快出声）
     if self.is_first_sentence:
@@ -637,13 +645,18 @@ def _get_segment_text(self):
         punctuations = self.punctuations  # 只包含强标点
 
     # 找最后一个标点
-    last_punct_pos = max(current_text.rfind(p) for p in punctuations)
+    for punct in punctuations:
+        pos = current_text.rfind(punct)
+        if (pos != -1 and last_punct_pos == -1) or (pos != -1 and pos < last_punct_pos):
+            last_punct_pos = pos
 
     if last_punct_pos != -1:
-        segment = current_text[:last_punct_pos + 1]
-        self.processed_chars += len(segment)
-        self.is_first_sentence = False  # 第一句话结束
-        return segment
+        segment_text_raw = current_text[: last_punct_pos + 1]
+        segment_text = textUtils.get_string_no_punctuation_or_emoji(segment_text_raw)
+        self.processed_chars += len(segment_text_raw)
+        if self.is_first_sentence:
+            self.is_first_sentence = False
+        return segment_text
 ```
 
 **三种接口类型：**
@@ -651,8 +664,8 @@ def _get_segment_text(self):
 | 类型 | 说明 | 示例 Provider |
 |------|------|---------------|
 | `NON_STREAM` | 整句合成后返回 | 大多数云 TTS |
-| `SINGLE_STREAM` | 单流式（文本流或音频流） | 部分 TTS |
-| `DUAL_STREAM` | 双流式（文本流 + 音频流并行） | GPT-SoVITS |
+| `SINGLE_STREAM` | 单流式（文本流或音频流） | MiniMax HTTP Stream |
+| `DUAL_STREAM` | 双流式（文本流 + 音频流并行） | 讯飞 / 火山引擎 |
 
 ### 4.7 音频出站流程
 

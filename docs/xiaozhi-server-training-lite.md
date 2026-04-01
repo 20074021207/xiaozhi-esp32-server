@@ -18,7 +18,16 @@
                            └──────── [Memory] ←───────────────┘
 ```
 
-支持 ASR（15+）、LLM（15+）、TTS（30+）等多家服务商，通过配置文件自由切换，无需改代码。
+**支持的服务商数量（截至本文档编写时）：**
+
+| 类型 | 数量 | 说明 |
+|------|------|------|
+| ASR | 15+ | FunASR、Sherpa-ONNX、Doubao、Aliyun、Tencent、Baidu、OpenAI 等 |
+| LLM | 15+ | ChatGLM、Doubao、DeepSeek、Gemini、Coze、Ollama、LM Studio 等 |
+| TTS | 30+ | Edge TTS、Doubao、CosyVoice、GPT-SoVITS、Fish Speech 等 |
+| VAD | 1 | Silero VAD |
+| Memory | 5 | mem0ai、PowerMem、mem_local_short、nomem、mem_report_only |
+| Intent | 3 | nointent、intent_llm、function_call |
 
 ### 1.2 技术栈速览
 
@@ -209,26 +218,38 @@ flowchart TB
 文件：`core/websocket_server.py` 第 81 行、`core/connection.py` 第 209 行
 
 ```mermaid
-flowchart LR
-    A["设备 WebSocket 连接"] --> B["提取 Headers<br/>(device-id, client-id)"]
-    B --> C["JWT 认证<br/>(白名单设备跳过)"]
-    C --> D["创建 ConnectionHandler<br/>(深拷贝 config, 生成 session_id)"]
-    D --> E["handle_connection(ws)"]
-    E --> F["获取事件循环 (loop)"]
-    F --> G["启动超时检查任务"]
-    G --> H["后台初始化 (_background_initialize)"]
-    H --> I["进入消息循环<br/>async for message in ws"]
+flowchart TB
+    subgraph WS["WebSocketServer._handle_connection() - websocket_server.py"]
+        A["设备 WebSocket 连接"] --> B["提取 Headers<br/>(device-id, client-id，URL query 参数回退)"]
+        B --> C["JWT 认证<br/>(白名单设备跳过)"]
+        C --> D["创建 ConnectionHandler"]
+        D --> E["调用 handle_connection(ws)"]
+    end
+
+    subgraph CH["ConnectionHandler.handle_connection() - connection.py"]
+        F["获取事件循环"]
+        G["设置连接上下文/初始化<br/>提取 headers/client_ip/device_id，设置 websocket，初始化时间戳/采样率"]
+        H["启动超时检查任务<br/>_check_timeout()"]
+        I["后台初始化<br/>_background_initialize()"]
+        J["进入消息循环<br/>async for message in websocket"]
+    end
+
+    E --> F
 ```
 
-**5 步详解：**
+**两级详解：**
 
-| 步骤 | 操作 | 文件位置 |
-|------|------|---------|
-| 1. 提取设备信息 | 从 Headers 或 URL query 参数获取 device-id | `websocket_server.py:82` |
-| 2. JWT 认证 | 白名单设备跳过，其余验证 Token | `websocket_server.py:206` |
-| 3. 创建 Handler | 每连接独立 `ConnectionHandler`，深拷贝配置 | `websocket_server.py:117` |
-| 4. 后台初始化 | 异步获取设备差异化配置，不阻塞主循环 | `connection.py:594` |
-| 5. 消息循环 | `async for message in self.websocket` 持续监听 | `connection.py:256` |
+| 阶段 | 步骤 | 操作 | 文件位置 |
+|------|------|------|---------|
+| WebSocketServer | 1 | 提取 device-id（Headers 或 URL query 参数回退） | `websocket_server.py:82` |
+| WebSocketServer | 2 | JWT 认证（白名单跳过，其余验证 Token） | `websocket_server.py:206` |
+| WebSocketServer | 3 | 创建 ConnectionHandler（深拷贝 config/传入共享模块） | `websocket_server.py:117` |
+| WebSocketServer | 4 | 调用 `handle_connection(ws)` | `websocket_server.py:131` |
+| ConnectionHandler | 5 | 获取事件循环 `get_running_loop()` | `connection.py:209` |
+| ConnectionHandler | 6 | 设置连接上下文/初始化（提取 IP/设备ID/检查 MQTT 来源/初始化时间戳/采样率） | `connection.py:215-252` |
+| ConnectionHandler | 7 | 启动超时检查任务 `_check_timeout()` | `connection.py:244` |
+| ConnectionHandler | 8 | 后台初始化 `_background_initialize()`（异步差异化配置） | `connection.py:594` |
+| ConnectionHandler | 9 | 进入消息循环 `async for message in websocket` | `connection.py:256` |
 
 ### 3.2 设备绑定机制
 
@@ -236,12 +257,22 @@ flowchart LR
 
 ```mermaid
 stateDiagram-v2
-    [*] --> 未绑定: 设备首次连接
-    未绑定 --> 绑定提示: 获取配置失败
-    绑定提示 --> 未绑定: 播报 6 位绑定码<br/>（所有消息被丢弃）
-    未绑定 --> 已绑定: 获取配置成功
+    [*] --> 后台初始化: 设备首次连接
+    后台初始化 --> 等待绑定: 获取配置失败<br/>(DeviceNotFoundException / DeviceBindException / Exception)
+    后台初始化 --> 已绑定: 无需绑定
+    等待绑定 --> 播报绑定码: _route_message() 1s 超时
+    播报绑定码 --> 等待绑定: 用户去智控台绑定
+    等待绑定 --> 已绑定: 绑定成功
     已绑定 --> [*]: 正常对话
 ```
+
+**实际流程：**
+1. `_initialize_private_config_async()` 成功 → `need_bind=False` + `bind_completed_event.set()` → 直接进入消息循环
+2. 失败 → `need_bind=True`，**但 event 保持未 set**
+3. `_route_message()` 检测到 event 未 set，wait() 最多 1 秒超时
+4. 超时 → `_discard_message_with_bind_prompt()` 播报 6 位绑定码
+5. 用户去智控台完成绑定后重连，进入成功路径
+
 
 ### 3.3 消息路由机制
 
@@ -345,14 +376,12 @@ flowchart TB
     A["累积 Opus 帧到 asr_audio"] --> B{"VAD 检测到停止?"}
     B -- "否" --> A
     B -- "是, 帧数 > 15" --> C["decode_opus()<br/>Opus → PCM 16kHz"]
-    C --> D["合并 PCM → WAV"]
-    D --> E["speech_to_text()<br/>调用具体 ASR 引擎"]
-    E --> F{"有声纹识别?"}
-    F -- "是" --> G["asyncio.gather<br/>ASR + 声纹并行"]
-    F -- "否" --> H["直接使用结果"]
-    G --> I["构建 JSON 文本<br/>{speaker, content, language}"]
-    H --> I
-    I --> J["startToChat(text)<br/>进入对话流程"]
+    C --> D{"有声纹识别?"}
+    D -- "否" --> E["speech_to_text()<br/>ASR 识别"]
+    D -- "是" --> F["asyncio.gather<br/>speech_to_text + identify_speaker<br/>ASR 与声纹并行"]
+    E --> G["构建 JSON 文本<br/>{content}"]
+    F --> G["构建 JSON 文本<br/>{speaker, content, language}"]
+    G --> H["startToChat(text)<br/>进入对话流程"]
 ```
 
 ### 4.4 意图识别与路由
@@ -377,12 +406,17 @@ flowchart TB
 flowchart TB
     Start["chat(query, depth=0)"] --> Check{"depth >= 5?"}
     Check -- "是" --> Force["强制直接回答<br/>（防无限递归）"]
-    Check -- "否" --> Record["记录对话历史<br/>发送 FIRST 标记"]
-    Record --> Rules{"对话 > 4 条?"}
-    Rules -- "是" --> Inject["注入工具调用规则<br/>（is_temporary=True）"]
-    Rules -- "否" --> Query["查询记忆"]
-    Inject --> Query
-    Query --> LLM["调用 LLM（流式）"]
+    Check -- "否" --> CheckDepth0{"depth == 0?"}
+    CheckDepth0 -- "是" --> Record["记录对话历史<br/>发送 FIRST 标记"]
+    CheckDepth0 -- "否" --> Memory["查询记忆"]
+    Record --> Lazy{"连续 > 3 轮<br/>未调用工具?"}
+    Lazy -- "是" --> InjectStrong["注入强提醒规则<br/>（强制工具调用）"]
+    Lazy -- "否" --> CheckLen{"dialogue > 4?"}
+    CheckLen -- "是" --> Inject["注入中提醒规则"]
+    CheckLen -- "否" --> Memory
+    Inject --> Memory
+    InjectStrong --> Memory
+    Memory --> LLM["调用 LLM（流式）"]
     LLM --> Stream["流式处理响应"]
 
     Stream --> Type{"响应类型?"}
@@ -390,18 +424,19 @@ flowchart TB
     Type -- "工具调用" --> ToolExec["执行工具"]
     ToolExec --> Recurse["chat(result, depth+1)<br/>递归调用"]
 
-    Push --> End["发送 LAST 标记"]
-    Recurse --> End
+    Push --> CheckDepth0B{"depth == 0?"}
+    Recurse --> CheckDepth0B
+    CheckDepth0B -- "是" --> End["发送 LAST 标记"]
+    CheckDepth0B -- "否" --> Return["返回"]
 ```
 
 **关键设计：**
 
 | 机制 | 说明 |
 |------|------|
-| 防偷懒 | 对话 > 4 条时动态注入 `TOOL_CALLING_RULES`，提醒 LLM 不要跳过工具调用 |
+| 防偷懒 | 连续 > 3 轮未调用工具时注入**强提醒**；对话 > 4 条时注入**中提醒** |
 | 临时消息 | `is_temporary=True` 的消息本轮后自动清理，不污染对话历史 |
 | 递归上限 | `MAX_DEPTH = 5`，防止工具调用无限递归 |
-| 记忆注入 | `memory.query_memory()` 结果通过 `<memory>` 标签注入对话 |
 
 ### 4.6 TTS 文本转语音
 
@@ -433,8 +468,8 @@ flowchart LR
 | 类型 | 说明 | 示例 Provider |
 |------|------|---------------|
 | `NON_STREAM` | 整句合成后返回 | 大多数云 TTS |
-| `SINGLE_STREAM` | 单流式（文本流或音频流） | 部分 TTS |
-| `DUAL_STREAM` | 双流式（文本流 + 音频流并行） | GPT-SoVITS |
+| `SINGLE_STREAM` | 单流式（文本流或音频流） | MiniMax HTTP Stream |
+| `DUAL_STREAM` | 双流式（文本流 + 音频流并行） | 讯飞 / 火山引擎 |
 
 ### 4.7 音频出站流程
 
