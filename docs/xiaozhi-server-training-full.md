@@ -466,11 +466,14 @@ flowchart LR
 ```
 设备 ──→ WebSocket bytes ──→ _route_message() ──→ asr_audio_queue
                                                      ↓
-                                              asr_text_priority_thread
+                                              asr_text_priority_thread()
                                                      ↓
                                               handleAudioMessage()
+                                                     ↓
+                                              conn.vad.is_vad()  ← VAD 检测
+                                                     ↓
+                                              conn.asr.receive_audio()  ← ASR 识别
 ```
-
 每个音频帧经过 4 步：
 
 | 步骤 | 操作 | 说明 |
@@ -501,26 +504,88 @@ async def handleAudioMessage(conn, audio):
 
 文件：`core/providers/vad/silero.py`
 
-- 模型：Silero VAD（ONNX 格式）
-- 采样率：16kHz（固定）
-- 分帧：512 样本/帧（约 32ms）
-- 阈值：> 0.5 视为有语音
+#### 流程概述
+
+1. **Opus 解码**：将收到的 Opus 数据包解码为 PCM（16kHz, 16bit）
+2. **缓冲分帧**：音频数据存入缓冲区，每 512 样本（32ms）为一帧处理
+3. **格式转换**：int16 → float32，归一化到 [-1, 1]
+4. **ONNX 推理**：拼接上下文向量后送入 Silero VAD 模型，得到语音概率
+5. **双阈值判断**：高阈值（>0.5）认定有语音，低阈值（<0.2）认定无语音，中间值保持前状态
+6. **滑动窗口**：连续 N 帧有语音才认定，避免误检
+
+#### 详细伪代码
 
 ```python
-# 流程：Opus → PCM (16kHz) → 分帧 → ONNX 推理 → 阈值判断
-def is_vad(self, conn, data):
-    pcm_data = self._decode_opus(data)
-    for frame in split_frames(pcm_data, 512):
-        prob = self.model(frame)
-        if prob > self.threshold:
-            return True
-    return False
+def is_vad(self, conn, opus_packet):
+    # Manual 模式：直接返回 True，所有音频都缓存
+    if conn.client_listen_mode == "manual":
+        return True
+
+    # 1. 初始化连接状态（仅首次）
+    if not hasattr(conn, "_vad_opus_decoder"):
+        conn._vad_opus_decoder = opuslib_next.Decoder(16000, 1)
+        conn._vad_state = np.zeros((2, 1, 128), dtype=np.float32)  # RNN 状态
+        conn._vad_context = np.zeros((1, 64), dtype=np.float32)    # 上下文
+
+    # 2. Opus → PCM 解码
+    pcm_frame = conn._vad_opus_decoder.decode(opus_packet, 960)
+    conn.client_audio_buffer.extend(pcm_frame)
+
+    # 3. 分帧处理（每帧 512 样本 = 32ms@16kHz）
+    while len(conn.client_audio_buffer) >= 512 * 2:
+        chunk = conn.client_audio_buffer[:512 * 2]
+        conn.client_audio_buffer = conn.client_audio_buffer[512 * 2:]
+
+        # 4. 预处理：int16 → float32，归一化
+        audio_float32 = chunk.astype(np.float32) / 32768.0
+
+        # 5. 拼接上下文（前 64 样本）
+        audio_input = concat(conn._vad_context, audio_float32)
+
+        # 6. ONNX 推理
+        output, new_state = session.run(
+            input=audio_input,
+            state=conn._vad_state,
+            sr=16000
+        )
+        conn._vad_state = new_state
+        conn._vad_context = audio_input[:, -64:]
+
+        # 7. 双阈值判断（带滞后效应）
+        if speech_prob >= self.vad_threshold:       # 高阈值 → 有声音
+            is_voice = True
+        elif speech_prob <= self.vad_threshold_low: # 低阈值 → 无声音
+            is_voice = False
+        else:
+            is_voice = conn.last_is_voice           # 中间值 → 保持前状态
+
+        # 8. 滑动窗口判断（至少 3 帧有声音才认定）
+        conn.client_voice_window.append(is_voice)
+        client_have_voice = (
+            conn.client_voice_window.count(True) >= self.frame_window_threshold
+        )
+
+        # 9. 静默检测（超过阈值时间则认为说完）
+        if conn.client_have_voice and not client_have_voice:
+            if (now - conn.last_activity_time) >= self.silence_threshold_ms:
+                conn.client_voice_stop = True
+
+        # 10. 更新状态
+        if client_have_voice:
+            conn.client_have_voice = True
+            conn.last_activity_time = now
+
+    return client_have_voice
 ```
+
+#### VAD 状态变量
 
 VAD 状态变量（`connection.py`）：
 - `client_have_voice`: 当前是否有语音
 - `client_voice_stop`: 语音是否结束（用于触发 ASR）
 - `client_voice_window`: 滑动窗口（deque maxlen=5），用于平滑检测
+- `client_audio_buffer`: 音频缓冲队列
+- `last_activity_time`: 最后一次检测到语音的时间戳
 
 ### 4.3 ASR 语音识别
 
@@ -730,22 +795,30 @@ def chat(self, query, depth=0):
 
 文件：`core/providers/tts/base.py`
 
-**双队列架构：** todo
+**双队列架构：**
+
+文本队列与音频队列将 TTS 流程拆分为**生产者**（文本处理）和**消费者**（音频播放）两个独立线程，通过队列解耦实现并行处理。
 
 ```mermaid
-flowchart LR
-    subgraph TextThread["tts_text_priority_thread"]
-        A["从 tts_text_queue<br/>取出文本"] --> B{"第一句?"}
+flowchart TB
+    Q1["tts_text_queue<br/>文本队列"]
+    Q1 --> A
+
+    subgraph TextThread["tts_text_priority_thread（生产者）"]
+        A["取出文本"] --> B{"第一句?"}
         B -- "是" --> C["宽泛标点分句<br/>（含逗号，尽快出声）"]
         B -- "否" --> D["强标点分句<br/>（句号/问号/感叹号）"]
-        C --> E["text_to_speak()"]
+        C --> E["to_tts_stream()"]
         D --> E
-        E --> F["Opus 编码"]
+        E --> F["handle_opus()"]
     end
 
-    F --> G["tts_audio_queue"]
+    F --> Q2
 
-    subgraph PlayThread["_audio_play_priority_thread"]
+    Q2["tts_audio_queue<br/>音频队列"]
+    Q2 --> G
+
+    subgraph PlayThread["_audio_play_priority_thread（消费者）"]
         G["取出音频"] --> H["sendAudioMessage()"]
         H --> I["WebSocket → 设备"]
     end
