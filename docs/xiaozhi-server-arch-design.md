@@ -1,4 +1,4 @@
-# xiaozhi-server 开发者培训手册
+# xiaozhi-server 项目架构与设计
   
 > 本文档面向全栈开发工程师，帮助快速理解 `main/xiaozhi-server` 模块的架构设计、核心流程和扩展方式。
   
