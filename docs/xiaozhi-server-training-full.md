@@ -1,10 +1,15 @@
-# xiaozhi-server 开发者培训手册
+# xiaozhi-server 项目架构与设计
 
 > 本文档面向全栈开发工程师，帮助快速理解 `main/xiaozhi-server` 模块的架构设计、核心流程和扩展方式。
 
 ---
 
 ## 1. 项目概览
+![请参考-全模块安装架构图](./images/deploy2.png)
+
+- [服务端整体说明文档](../README.md)
+
+- [核心语音服务xiaozhi-server说明文档](../main/README.md)
 
 ### 1.1 项目简介
 
