@@ -66,11 +66,11 @@
 **配置优先级链：**
 
 ```
-data/.config.yaml（本地覆盖，git-ignored）
-    ↓
-config.yaml（默认配置）
-    ↓
-manager-api 远程配置（当 read_config_from_api: true 时）
+manager-api 远程配置（基础配置源）
+    ↓  ↑
+data/.config.yaml（选择性覆盖 server.* 和 manager-api.* 字段）
+    ↓  ↑
+config.yaml（最终 fallback）
 ```
 
 ### 1.4 目录结构导览
