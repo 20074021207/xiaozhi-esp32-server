@@ -5,7 +5,12 @@
 ---
   
 ## 1. 项目概览
-  
+![请参考-全模块安装架构图](./images/deploy2.png)
+
+- [服务端整体说明文档](../README.md)
+
+- [核心语音服务xiaozhi-server说明文档](../main/README.md)
+
 ### 1.1 项目简介
   
 **xiaozhi-server** 是一个基于 Python 的 AI 语音助手服务端，通过 WebSocket 与 ESP32 等硬件设备通信，实现实时语音对话。
