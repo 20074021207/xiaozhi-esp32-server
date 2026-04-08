@@ -38,10 +38,16 @@ async def get_config_from_api_async(config):
 2. Web界面点击"更新配置"按钮 ：在 ServerSideManager.vue 中点击 update_config ，通过 WebSocket 发送指令，触发 websocket_server.py#L155 的 update_config() 
 
 ### 4. 配置优先级
-从高到低：
-1. data/.config.yaml （本地覆盖配置）
-2. config.yaml （默认配置）
-3. manager-api 远程配置 （当 read_config_from_api: true 时）
+
+**优先级（从高到低）：**
+
+1. `manager-api` 远程配置（基础配置源，当 `.config.yaml` 中配置了 `manager-api.url` 时启用）
+2. `data/.config.yaml`（选择性覆盖，仅覆盖 `server.*`、`manager-api.*`、`prompt_template` 等特定字段）
+3. `config.yaml`（最终 fallback）
+
+**合并规则：**
+- 当启用 manager-api 时，大部分配置来自远程，但 `server.*`（ip/port/http_port/vision_explain/auth_key）和 `manager-api.*`（url/secret）以本地 `.config.yaml` 为准
+- `prompt_template` 以 manager-api 远程配置优先，本地仅作 fallback
 
 ### 5. 关键文件
 文件 作用 config_loader.py 配置加载与合并 manage_api_client.py 与 manager-api 通信的 HTTP 客户端 ConfigController.java manager-api 配置接口 ConfigServiceImpl.java 配置服务实现，先查 Redis，没有则查数据库

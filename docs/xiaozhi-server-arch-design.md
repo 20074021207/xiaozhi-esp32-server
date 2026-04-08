@@ -1119,12 +1119,16 @@ plugins:
 ```
   
 ### 7.2 配置加载与覆盖
-  
+
 **优先级（从高到低）：**
-  
-1. `data/.config.yaml`（本地覆盖，git-ignored）
-2. `config.yaml`（默认配置）
-3. manager-api 远程配置（当 `read_config_from_api: true`）
+
+1. `manager-api` 远程配置（基础配置源，当 `.config.yaml` 中配置了 `manager-api.url` 时启用）
+2. `data/.config.yaml`（选择性覆盖，仅覆盖 `server.*`、`manager-api.*`、`prompt_template` 等特定字段）
+3. `config.yaml`（最终 fallback）
+
+**合并规则：**
+- 当启用 manager-api 时，大部分配置来自远程，但 `server.*`（ip/port/http_port/vision_explain/auth_key）和 `manager-api.*`（url/secret）以本地 `.config.yaml` 为准
+- `prompt_template` 以 manager-api 远程配置优先，本地仅作 fallback
   
 **设备差异化配置：**
   
